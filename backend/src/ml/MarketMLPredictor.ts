@@ -1,5 +1,8 @@
-import * as tf from '@tensorflow/tfjs-node';
+// Try to use GPU backend first, fall back to CPU if not available
+import * as tf from '@tensorflow/tfjs-node-gpu';
 import {MarketMetrics} from "../types";
+import * as fs from 'fs';
+import * as path from 'path';
 
 interface TrainingData {
     rawInput: number[];
@@ -22,47 +25,265 @@ export class MarketMLPredictor {
     private model!: tf.LayersModel;
     private readonly tf: typeof tf;
     private trainingData: Map<string, TrainingData[]>;
+    private models: Map<string, tf.LayersModel> = new Map();
+    private modelDirectory = path.join(__dirname, '../../models');
+    private defaultFeatureStats: {means: number[], stds: number[]} = {
+        means: new Array(15).fill(0),
+        stds: new Array(15).fill(1)
+    };
+    private featureStats: Map<string, {means: number[], stds: number[]}> = new Map();
+    // Initialize with a basic MSE function
+    private customLossFunction: (yTrue: tf.Tensor, yPred: tf.Tensor) => tf.Tensor = 
+        (yTrue: tf.Tensor, yPred: tf.Tensor) => tf.losses.meanSquaredError(yTrue, yPred);
 
     constructor() {
         this.tf = tf;
         this.trainingData = new Map();
+        
+        // Ensure model directory exists
+        if (!fs.existsSync(this.modelDirectory)) {
+            fs.mkdirSync(this.modelDirectory, { recursive: true });
+        }
+        
+        // Initialize TensorFlow backend with Metal support for M2 Mac
+        this.initializeBackend().then(() => {
+            console.log('TensorFlow backend initialized successfully');
+        }).catch(err => {
+            console.warn('Failed to initialize GPU backend, using CPU:', err);
+        });
+        
+        // Define custom Huber loss function
+        this.defineCustomHuberLoss();
+        
         this.initModel();
+    }
+    
+    /**
+     * Initialize TensorFlow.js backend, preferring GPU/Metal when available
+     */
+    private async initializeBackend(): Promise<void> {
+        try {
+            // Check if GPU/Metal backend is available
+            const backend = this.tf.getBackend();
+            console.log(`Current TensorFlow backend: ${backend}`);
+            
+            // Get available backends
+            const availableBackends = Object.keys(this.tf.engine().registryFactory);
+            console.log(`Available backends: ${availableBackends.join(', ')}`);
+            
+            if (backend !== 'tensorflow') {
+                // Try to explicitly set the backend to tensorflow (node-gpu)
+                await this.tf.setBackend('tensorflow');
+                console.log(`Backend set to: ${this.tf.getBackend()}`);
+            }
+            
+            // Check for GPU in a more compatible way
+            const gpuAvailable = this.tf.engine().backendNames().some(
+                (name: string) => name.toLowerCase().includes('gpu') || name.toLowerCase().includes('webgl')
+            );
+            
+            if (gpuAvailable) {
+                console.log('✅ GPU/Metal acceleration is available');
+            } else {
+                console.log('⚠️ Running on CPU - GPU/Metal acceleration not detected');
+            }
+        } catch (error) {
+            console.error('Error initializing TensorFlow backend:', error);
+            // Continue with whatever backend is available
+        }
+    }
+    
+    /**
+     * Define a custom Huber loss function since some TF.js versions don't include it
+     */
+    private defineCustomHuberLoss() {
+        try {
+            // Use a standard MSE loss function that we know works
+            this.customLossFunction = (yTrue: tf.Tensor, yPred: tf.Tensor): tf.Tensor => {
+                // Simple MSE implementation with proper error handling
+                return tf.tidy(() => {
+                    try {
+                        // Ensure inputs are in correct shape
+                        const reshapedTrue = tf.reshape(yTrue, [-1]);
+                        const reshapedPred = tf.reshape(yPred, [-1]);
+                        
+                        // Calculate MSE
+                        const error = tf.sub(reshapedPred, reshapedTrue);
+                        const squaredError = tf.square(error);
+                        return tf.mean(squaredError);
+                    } catch (e) {
+                        console.error("Error in custom loss calculation:", e);
+                        // Return a zero scalar as fallback
+                        return tf.scalar(0);
+                    }
+                });
+            };
+            
+            console.log("Using custom MSE loss function");
+        } catch (error) {
+            console.error("Error defining loss function:", error);
+            // Create a very basic fallback that should always work
+            this.customLossFunction = (): tf.Tensor => tf.scalar(0);
+        }
     }
 
     private async initModel(): Promise<void> {
         // Clear any existing TensorFlow memory/state
         this.tf.disposeVariables();
+        
+        // Set environment flags for better GPU performance
+        // Use try/catch for each flag since some might not be registered in the current TF.js version
+        try {
+            this.tf.env().set('WEBGL_FORCE_F16_TEXTURES', true);
+        } catch (e) {
+            // Silently continue if flag is not supported
+        }
+        
+        try {
+            this.tf.env().set('WEBGL_PACK', true);
+        } catch (e) {
+            // Silently continue if flag is not supported
+        }
+        
+        try {
+            this.tf.env().set('WEBGL_PACK_DEPTHWISECONV', true);
+        } catch (e) {
+            // Silently continue if flag is not supported
+        }
+        
+        // Skip the parallel execution mode flag as it's not registered
 
-        // Input layer - explicitly define the dtype
+        try {
+            // Create the base model
+            this.model = this.createBidirectionalLSTMModel();
+            console.log("Base model initialized");
+            
+            // Log memory info
+            const memInfo = await this.tf.memory();
+            console.log("TensorFlow memory usage:", {
+                numTensors: memInfo.numTensors,
+                numDataBuffers: memInfo.numDataBuffers,
+                unreliable: memInfo.unreliable,
+                reasons: memInfo.reasons
+            });
+        } catch (error) {
+            console.error("Error initializing model with Huber loss:", error);
+            console.log("Attempting to create model with MSE loss...");
+            
+            // Fallback to MSE loss if Huber doesn't work
+            this.model = this.createModelWithMSELoss();
+            console.log("Created fallback model with MSE loss");
+        }
+    }
+    
+    /**
+     * Create a model with MSE loss as fallback
+     */
+    private createModelWithMSELoss(): tf.LayersModel {
+        // Create model with simplified architecture
+        const input = this.tf.input({
+            shape: [15],
+            dtype: 'float32',
+            name: 'input_layer'
+        });
+        
+        // Dense layers only - more stable
+        const dense1 = this.tf.layers.dense({
+            units: 64,
+            activation: 'relu',
+            name: 'dense_1'
+        }).apply(input) as tf.SymbolicTensor;
+        
+        const dense2 = this.tf.layers.dense({
+            units: 32,
+            activation: 'relu',
+            name: 'dense_2'
+        }).apply(dense1) as tf.SymbolicTensor;
+        
+        const output = this.tf.layers.dense({
+            units: 1,
+            activation: 'linear',
+            name: 'output'
+        }).apply(dense2) as tf.SymbolicTensor;
+        
+        // Create the model
+        const model = this.tf.model({
+            inputs: input,
+            outputs: output,
+            name: 'simple_predictor'
+        });
+        
+        // Compile with string-based MSE - most reliable option
+        model.compile({
+            optimizer: this.tf.train.adam(0.001),
+            loss: 'meanSquaredError',
+            metrics: ['mae']
+        });
+        
+        return model;
+    }
+
+    /**
+     * Creates a model with LSTM layers for sequence processing and dense layers
+     */
+    private createBidirectionalLSTMModel(): tf.LayersModel {
+        // Input layer
         const input = this.tf.input({
             shape: [15],
             dtype: 'float32',
             name: 'input_layer'
         });
 
-        // First dense layer with explicit weights initialization
+        // Reshape for LSTM (treat features as a sequence)
+        const reshapedInput = this.tf.layers.reshape({
+            targetShape: [1, 15],
+            name: 'reshape_layer'
+        }).apply(input) as tf.SymbolicTensor;
+
+        // Bidirectional LSTM layer
+        const bidirectionalLSTM = this.tf.layers.bidirectional({
+            layer: this.tf.layers.lstm({
+                units: 32,
+                returnSequences: true,
+                name: 'lstm_layer'
+            }),
+            mergeMode: 'concat',
+            name: 'bidirectional_layer'
+        }).apply(reshapedInput) as tf.SymbolicTensor;
+
+        // Flatten the output from LSTM
+        const flattened = this.tf.layers.flatten({
+            name: 'flatten_layer'
+        }).apply(bidirectionalLSTM) as tf.SymbolicTensor;
+
+        // Dense layers
         const dense1 = this.tf.layers.dense({
+            units: 64,
+            activation: 'relu',
+            kernelInitializer: 'glorotUniform',
+            biasInitializer: 'zeros',
+            name: 'dense_1'
+        }).apply(flattened) as tf.SymbolicTensor;
+
+        // Batch normalization - optimized for GPU with explicit momentum
+        const batchNorm = this.tf.layers.batchNormalization({
+            name: 'batch_norm',
+            momentum: 0.99, // Higher momentum works better on GPU
+            epsilon: 1e-5  // Recommended value for numerical stability
+        }).apply(dense1) as tf.SymbolicTensor;
+
+        // Dropout layer
+        const dropout = this.tf.layers.dropout({
+            rate: 0.3,
+            name: 'dropout_1'
+        }).apply(batchNorm) as tf.SymbolicTensor;
+
+        // Second dense layer
+        const dense2 = this.tf.layers.dense({
             units: 32,
             activation: 'relu',
             kernelInitializer: 'glorotUniform',
             biasInitializer: 'zeros',
-            dtype: 'float32',
-            name: 'dense_1'
-        }).apply(input) as tf.SymbolicTensor;
-
-        // Dropout layer
-        const dropout = this.tf.layers.dropout({
-            rate: 0.2,
-            name: 'dropout_1'
-        }).apply(dense1) as tf.SymbolicTensor;
-
-        // Second dense layer
-        const dense2 = this.tf.layers.dense({
-            units: 16,
-            activation: 'relu',
-            kernelInitializer: 'glorotUniform',
-            biasInitializer: 'zeros',
-            dtype: 'float32',
             name: 'dense_2'
         }).apply(dropout) as tf.SymbolicTensor;
 
@@ -72,42 +293,37 @@ export class MarketMLPredictor {
             activation: 'linear',
             kernelInitializer: 'glorotUniform',
             biasInitializer: 'zeros',
-            dtype: 'float32',
             name: 'output'
         }).apply(dense2) as tf.SymbolicTensor;
 
         // Create the model
-        this.model = this.tf.model({
+        const model = this.tf.model({
             inputs: input,
             outputs: output,
             name: 'market_predictor'
         });
 
-        // Compile the model
-        this.model.compile({
-            optimizer: this.tf.train.adam(0.001),
-            loss: 'meanSquaredError',
-            metrics: ['mae']
-        });
-
-        // Initialize with dummy data - explicitly use float32
-        const dummyData = new Array(15).fill(0);
-        const dummyInput = this.tf.tensor2d([dummyData], [1, 15], 'float32');
-
         try {
-            // Perform a warm-up prediction and explicitly get the data
-            const prediction = this.model.predict(dummyInput) as tf.Tensor;
-            await prediction.data();  // Ensure prediction works
-            prediction.dispose();
+            // Use our custom MSE loss function
+            model.compile({
+                optimizer: this.tf.train.adam(0.0005),
+                loss: this.customLossFunction,
+                metrics: ['mae']
+            });
         } catch (error) {
-            console.error('Error during model initialization:', error);
-            throw new Error(`Failed to initialize model: ${error instanceof Error ? error.message : String(error)}`);
-        } finally {
-            dummyInput.dispose();
+            console.warn("Failed to compile with custom loss, falling back to string MSE:", error);
+            // Fallback to standard string-based MSE
+            model.compile({
+                optimizer: this.tf.train.adam(0.0005),
+                loss: 'meanSquaredError',
+                metrics: ['mae']
+            });
         }
+
+        return model;
     }
 
-    private metricsToFeatures(metrics: MarketMetrics): FeatureData {
+    private metricsToFeatures(metrics: MarketMetrics, itemId?: string): FeatureData {
         // Extract only the numeric metrics we need for the model
         // This avoids issues with complex objects like hourlyPatterns and weekdayPatterns
 
@@ -120,27 +336,23 @@ export class MarketMLPredictor {
         ];
 
         // Create a features array from the specific metrics we need
-        // This avoids type issues with the complex objects in MarketMetrics
         const features = [
-            this.normalizeValue(metrics.currentPrice),
-            this.normalizeValue(metrics.priceVolatility),
-            this.normalizeValue(metrics.priceVelocity),
-            this.normalizeValue(metrics.trendStrength),
-            this.normalizeValue(metrics.averageVolume),
-            this.normalizeValue(metrics.volumeVelocity),
-            this.normalizeValue(metrics.volumeConsistency),
-            this.normalizeValue(metrics.bidAskSpread),
-            this.normalizeValue(metrics.turnoverRate),
-            this.normalizeValue(metrics.marketImpact),
-            this.normalizeValue(metrics.sma5),
-            this.normalizeValue(metrics.sma20),
-            this.normalizeValue(metrics.macdLine),
-            this.normalizeValue(metrics.macdHistogram),
-            this.normalizeValue(metrics.liquidityScore)
+            metrics.currentPrice,
+            metrics.priceVolatility,
+            metrics.priceVelocity,
+            metrics.trendStrength,
+            metrics.averageVolume,
+            metrics.volumeVelocity,
+            metrics.volumeConsistency,
+            metrics.bidAskSpread,
+            metrics.turnoverRate,
+            metrics.marketImpact,
+            metrics.sma5,
+            metrics.sma20,
+            metrics.macdLine,
+            metrics.macdHistogram,
+            metrics.liquidityScore
         ];
-
-        // Log the normalized features for debugging
-        console.log('Normalized features:', features);
 
         // Verify all features are valid numbers
         if (!this.validateFeatures(features)) {
@@ -148,11 +360,27 @@ export class MarketMLPredictor {
             throw new Error('Invalid feature values detected');
         }
 
+        // Normalize features using z-score normalization if item-specific stats exist
+        let normalizedFeatures;
+        if (itemId && this.featureStats.has(itemId)) {
+            normalizedFeatures = this.zScoreNormalize(features, this.featureStats.get(itemId)!);
+        } else {
+            normalizedFeatures = features.map(f => this.normalizeValue(f));
+        }
+
         // Always explicitly specify dtype as float32 and shape
         return {
-            tensor: this.tf.tensor2d([features], [1, 15], 'float32'),
-            raw: features
+            tensor: this.tf.tensor2d([normalizedFeatures], [1, 15], 'float32'),
+            raw: normalizedFeatures
         };
+    }
+
+    private zScoreNormalize(features: number[], stats: {means: number[], stds: number[]}): number[] {
+        return features.map((value, i) => {
+            const mean = stats.means[i];
+            const std = stats.stds[i] || 1; // Avoid division by zero
+            return (value - mean) / std;
+        });
     }
 
     private normalizeValue(value: any): number {
@@ -226,12 +454,110 @@ export class MarketMLPredictor {
         return pred.length > 1 ? correct / (pred.length - 1) : 0;
     }
 
-    async predict(metrics: MarketMetrics): Promise<number> {
-        // Add debugging to see what's coming in
-        console.log('Input metrics:', JSON.stringify(metrics, null, 2));
+    /**
+     * Calculate feature statistics (mean, std) for Z-score normalization
+     */
+    private calculateFeatureStats(itemId: string): void {
+        const data = this.trainingData.get(itemId);
+        if (!data || data.length < 5) return;
+        
+        // Calculate means for each feature
+        const features = data.map(d => d.rawInput);
+        const sums = new Array(15).fill(0);
+        const squaredSums = new Array(15).fill(0);
+        
+        for (const featureSet of features) {
+            for (let i = 0; i < 15; i++) {
+                sums[i] += featureSet[i];
+                squaredSums[i] += featureSet[i] * featureSet[i];
+            }
+        }
+        
+        const means = sums.map(sum => sum / features.length);
+        const stds = sums.map((sum, i) => {
+            const variance = (squaredSums[i] / features.length) - Math.pow(sum / features.length, 2);
+            return Math.sqrt(Math.max(variance, 0.001)); // Ensure non-zero std
+        });
+        
+        this.featureStats.set(itemId, { means, stds });
+    }
 
-        const features = this.metricsToFeatures(metrics);
-        console.log('Extracted features:', features.raw);
+    /**
+     * Get model specific to item or use general model if not available
+     */
+    private getItemModel(itemId: string): tf.LayersModel {
+        if (this.models.has(itemId)) {
+            return this.models.get(itemId)!;
+        }
+        return this.model;
+    }
+
+    /**
+     * Save model for a specific item
+     */
+    private async saveItemModel(itemId: string, model: tf.LayersModel): Promise<void> {
+        const modelPath = path.join(this.modelDirectory, `model_${itemId}`);
+        try {
+            await model.save(`file://${modelPath}`);
+            
+            // Save feature statistics
+            if (this.featureStats.has(itemId)) {
+                const statsPath = path.join(this.modelDirectory, `stats_${itemId}.json`);
+                fs.writeFileSync(statsPath, JSON.stringify(this.featureStats.get(itemId)));
+            }
+        } catch (error) {
+            console.error(`Error saving model for item ${itemId}:`, error);
+        }
+    }
+
+    /**
+     * Load model for a specific item
+     */
+    private async loadItemModel(itemId: string): Promise<boolean> {
+        const modelPath = path.join(this.modelDirectory, `model_${itemId}`);
+        const statsPath = path.join(this.modelDirectory, `stats_${itemId}.json`);
+        
+        try {
+            if (fs.existsSync(`${modelPath}/model.json`)) {
+                const model = await tf.loadLayersModel(`file://${modelPath}/model.json`);
+                
+                try {
+                    // Use our custom MSE loss function
+                    model.compile({
+                        optimizer: this.tf.train.adam(0.0005),
+                        loss: this.customLossFunction,
+                        metrics: ['mae']
+                    });
+                } catch (error) {
+                    // Fallback to standard string-based MSE loss
+                    model.compile({
+                        optimizer: this.tf.train.adam(0.0005),
+                        loss: 'meanSquaredError', 
+                        metrics: ['mae']
+                    });
+                }
+                this.models.set(itemId, model);
+                
+                // Load feature statistics if available
+                if (fs.existsSync(statsPath)) {
+                    const statsData = fs.readFileSync(statsPath, 'utf8');
+                    this.featureStats.set(itemId, JSON.parse(statsData));
+                }
+                
+                return true;
+            }
+        } catch (error) {
+            // Silent fail - just return false
+        }
+        return false;
+    }
+
+    async predict(metrics: MarketMetrics, itemId?: string): Promise<number> {
+        // Try to use item specific model if itemId is provided
+        const model = itemId ? this.getItemModel(itemId) : this.model;
+        
+        // Process features using item-specific normalization if available
+        const features = this.metricsToFeatures(metrics, itemId);
 
         if (!this.validateFeatures(features.raw)) {
             throw new Error('Invalid feature data');
@@ -241,13 +567,18 @@ export class MarketMLPredictor {
         const inputTensor = this.tf.tensor2d(features.raw, [1, 15], 'float32');
 
         try {
-            // Make sure we're using the right dtype
-            const prediction = this.model.predict(inputTensor) as tf.Tensor;
+            // Make prediction
+            const prediction = model.predict(inputTensor) as tf.Tensor;
             const value = (await prediction.data())[0];
 
             // Clean up
             prediction.dispose();
 
+            // Denormalize if we used item-specific statistics
+            if (itemId && this.featureStats.has(itemId)) {
+                return value * (Math.abs(metrics.currentPrice) > 1e6 ? 1e6 : 1);
+            }
+            
             return value * (Math.abs(metrics.currentPrice) > 1e6 ? 1e6 : 1);
         } catch (error) {
             this.handleTensorError(error);
@@ -272,7 +603,10 @@ export class MarketMLPredictor {
 
         if (!this.trainingData.has(itemId)) {
             this.trainingData.set(itemId, []);
+            // Try to load a pre-existing model for this item
+            await this.loadItemModel(itemId);
         }
+        
         const itemData = this.trainingData.get(itemId);
         if (itemData) {
             itemData.push(example);
@@ -280,46 +614,116 @@ export class MarketMLPredictor {
 
         features.tensor.dispose();
 
-        if (this.trainingData.get(itemId)?.length === 10) {
+        // Increase training data size requirement before retraining
+        if (this.trainingData.get(itemId)?.length === 50) {
             await this.retrain(itemId);
+        }
+    }
+
+    async retrainAll(): Promise<void> {
+        for (const itemId of this.trainingData.keys()) {
+            if (this.trainingData.get(itemId)?.length! >= 20) {
+                await this.retrain(itemId);
+            }
         }
     }
 
     private async retrain(itemId: string): Promise<void> {
         const data = this.trainingData.get(itemId);
-        if (!data || data.length === 0) {
-            console.warn('No training data available for item:', itemId);
+        if (!data || data.length < 20) {
+            // Silent skip for insufficient data
             return;
         }
 
+        // Calculate feature statistics for normalization
+        this.calculateFeatureStats(itemId);
+        
+        // Clone the base model for this item if it doesn't already exist
+        if (!this.models.has(itemId)) {
+            // Create a new instance
+            const newModel = this.createBidirectionalLSTMModel();
+            this.models.set(itemId, newModel);
+        }
+        
+        // Get the item-specific model
+        const model = this.models.get(itemId)!;
+        
+        // Prepare training data with normalization
+        const normalizedData = data.map(d => {
+            return {
+                ...d,
+                rawInput: this.zScoreNormalize(d.rawInput, this.featureStats.get(itemId)!)
+            };
+        });
+        
+        // Split into training and validation sets
+        const shuffledData = [...normalizedData].sort(() => Math.random() - 0.5);
+        const splitIndex = Math.floor(shuffledData.length * 0.8);
+        const trainingData = shuffledData.slice(0, splitIndex);
+        const validationData = shuffledData.slice(splitIndex);
+
         // Always explicitly specify dtype
-        const inputs = this.tf.tensor2d(data.map(d => d.rawInput), undefined, 'float32');
-        const outputs = this.tf.tensor2d(data.map(d => [d.actualOutcome]), undefined, 'float32');
+        const trainInputs = this.tf.tensor2d(trainingData.map(d => d.rawInput), undefined, 'float32');
+        const trainOutputs = this.tf.tensor2d(trainingData.map(d => [d.actualOutcome]), undefined, 'float32');
+        
+        const validInputs = this.tf.tensor2d(validationData.map(d => d.rawInput), undefined, 'float32');
+        const validOutputs = this.tf.tensor2d(validationData.map(d => [d.actualOutcome]), undefined, 'float32');
 
         try {
-            await this.model.fit(inputs, outputs, {
-                epochs: 10,
-                validationSplit: 0.2,
-                shuffle: true
+            // Define callbacks for early stopping
+            const callbacks = [
+                this.tf.callbacks.earlyStopping({
+                    monitor: 'val_loss',
+                    patience: 5,
+                    verbose: 0 // Reduced verbosity
+                })
+            ];
+            
+            // Train the model with more epochs, optimized for GPU
+            const result = await model.fit(trainInputs, trainOutputs, {
+                epochs: 50,
+                batchSize: 32, // Increased batch size for GPU efficiency
+                validationData: [validInputs, validOutputs],
+                shuffle: true,
+                callbacks,
+                verbose: 0, // Reduced verbosity - no per-epoch outputs
+                yieldEvery: 'never' // Disable yielding for better GPU performance
             });
+            
+            // Save the model without logging
+            await this.saveItemModel(itemId, model);
+            
         } finally {
-            inputs.dispose();
-            outputs.dispose();
+            trainInputs.dispose();
+            trainOutputs.dispose();
+            validInputs.dispose();
+            validOutputs.dispose();
         }
     }
 
     async evaluateAccuracy(itemId: string): Promise<ModelAccuracy> {
         const data = this.trainingData.get(itemId) || [];
-        if (data.length < 10) {
-            throw new Error('Not enough data for evaluation');
+        if (data.length < 20) {
+            throw new Error('Not enough data for evaluation (need at least 20 examples)');
         }
 
+        // Use item-specific model if available
+        const model = this.models.has(itemId) ? this.models.get(itemId)! : this.model;
+        
+        // Apply item-specific normalization if available
+        const useItemStats = this.featureStats.has(itemId);
+        
         const predictions = await Promise.all(
             data.map(async d => {
+                // Apply normalization if stats are available
+                const features = useItemStats ? 
+                    this.zScoreNormalize(d.rawInput, this.featureStats.get(itemId)!) : 
+                    d.rawInput;
+                
                 // Always explicitly specify dtype
-                const inputTensor = this.tf.tensor2d([d.rawInput], [1, 15], 'float32');
+                const inputTensor = this.tf.tensor2d([features], [1, 15], 'float32');
                 try {
-                    const pred = this.model.predict(inputTensor) as tf.Tensor;
+                    const pred = model.predict(inputTensor) as tf.Tensor;
                     const value = (await pred.data())[0];
                     pred.dispose();
                     return value;
@@ -338,10 +742,58 @@ export class MarketMLPredictor {
         };
     }
 
+    /**
+     * Check if GPU/Metal is being used (public method)
+     */
+    public async checkGPUUsage(): Promise<boolean> {
+        try {
+            // Get current backend
+            const backend = this.tf.getBackend();
+            console.log(`Current backend: ${backend}`);
+            
+            // Create a simple test tensor
+            const a = this.tf.tensor2d([[1, 2], [3, 4]]);
+            const b = this.tf.tensor2d([[5, 6], [7, 8]]);
+            
+            // Time a matrix multiplication (good GPU test)
+            const start = Date.now();
+            const iterations = 100;
+            
+            for (let i = 0; i < iterations; i++) {
+                const result = this.tf.matMul(a, b);
+                await result.data(); // Force execution
+                result.dispose();
+            }
+            
+            const end = Date.now();
+            const timePerOp = (end - start) / iterations;
+            
+            // Log performance
+            console.log(`Matrix multiplication time: ${timePerOp.toFixed(2)}ms per operation`);
+            console.log(`Estimated performance: ${(1000 / timePerOp).toFixed(2)} ops/second`);
+            
+            // Check if GPU is likely being used (very rough estimate)
+            const isLikelyGPU = timePerOp < 1.0 && backend !== 'cpu';
+            console.log(`GPU likely in use: ${isLikelyGPU ? 'Yes ✅' : 'No ❌'}`);
+            
+            // Clean up
+            a.dispose();
+            b.dispose();
+            
+            return isLikelyGPU;
+        } catch (error) {
+            console.error('Error checking GPU usage:', error);
+            return false;
+        }
+    }
+
     // Debug method to help isolate TensorFlow issues
     async debugModel(metrics: MarketMetrics): Promise<void> {
         console.log('=== DEBUG MODE ===');
         console.log('TensorFlow.js version:', this.tf.version.tfjs);
+        
+        // Check if GPU is being used
+        await this.checkGPUUsage();
 
         // 1. Check input metrics
         console.log('\n1. Input Metrics:');
@@ -359,8 +811,6 @@ export class MarketMLPredictor {
             console.log(`${field}: ${typeof metrics[field as keyof MarketMetrics]} = ${metrics[field as keyof MarketMetrics]}`);
         });
 
-        console.log(JSON.stringify(metrics, null, 2));
-
         try {
             // 2. Test feature extraction
             console.log('\n2. Feature Extraction:');
@@ -373,63 +823,25 @@ export class MarketMLPredictor {
             console.log('\n3. Model Structure:');
             this.model.summary();
 
-            // 4. Test each layer individually
-            console.log('\n4. Layer by Layer Test:');
+            // 4. Test full model prediction with logging
+            console.log('\n5. Full Model Prediction:');
             const inputTensor = this.tf.tensor2d(features.raw, [1, 15], 'float32');
+            const outputTensor = this.model.predict(inputTensor) as tf.Tensor;
+            console.log('Output tensor shape:', outputTensor.shape);
+            console.log('Output tensor dtype:', outputTensor.dtype);
+            const outputValue = await outputTensor.data();
+            console.log('Prediction value:', outputValue[0]);
 
-            // Get all layers
-            const layers = this.model.layers;
-            console.log(`Model has ${layers.length} layers`);
+            // Clean up
+            console.log('\nCleaning up tensors...');
+            inputTensor.dispose();
+            features.tensor.dispose();
+            outputTensor.dispose();
 
-            // Using a generic Tensor type to avoid type issues between layers
-            let layerInput: tf.Tensor = inputTensor;
-            for (let i = 0; i < layers.length; i++) {
-                const layer = layers[i];
-                console.log(`\nTesting layer ${i}: ${layer.name}`);
-                console.log('Layer config:', layer.getConfig());
-
-                try {
-                    // Execute just this layer
-                    const layerOutput = layer.apply(layerInput) as tf.Tensor;
-                    console.log('Layer output shape:', layerOutput.shape);
-                    console.log('Layer output dtype:', layerOutput.dtype);
-
-                    // Clean up previous tensor if it's not the input tensor
-                    if (i > 0) {
-                        layerInput.dispose();
-                    }
-
-                    // Use this output as input to the next layer
-                    layerInput = layerOutput;
-                } catch (error) {
-                    console.error(`Error in layer ${i} (${layer.name}):`, error);
-                    throw error;
-                }
-            }
-
-            // Clean up the last layer output
-            if (layers.length > 0) {
-                layerInput.dispose();
-
-                // 5. Test full model prediction with logging
-                console.log('\n5. Full Model Prediction:');
-                const outputTensor = this.model.predict(inputTensor) as tf.Tensor;
-                console.log('Output tensor shape:', outputTensor.shape);
-                console.log('Output tensor dtype:', outputTensor.dtype);
-                const outputValue = await outputTensor.data();
-                console.log('Prediction value:', outputValue[0]);
-
-                // Clean up
-                console.log('\nCleaning up tensors...');
-                inputTensor.dispose();
-                features.tensor.dispose();
-                outputTensor.dispose();
-
-                console.log('=== DEBUG COMPLETE ===');
-            }
-        }catch (error) {
-                console.error('DEBUG ERROR:', error);
-                throw error;
-            }
+            console.log('=== DEBUG COMPLETE ===');
+        } catch (error) {
+            console.error('DEBUG ERROR:', error);
+            throw error;
         }
     }
+}

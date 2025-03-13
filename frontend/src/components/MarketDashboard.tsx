@@ -34,6 +34,7 @@ interface ItemPrediction {
     metrics: ItemMetrics;
     buyRecommendation?: number;
     sellRecommendation?: number;
+    quantity?: number; // New field for recommended quantity
 }
 
 interface ModelAccuracy {
@@ -115,6 +116,11 @@ const ItemTableRow: React.FC<ItemTableRowProps> = ({ item, type }) => {
         ? item.metrics.currentPrice + item.predictedPriceChange
         : item.metrics.currentPrice - Math.abs(item.predictedPriceChange);
 
+    // Calculate total profit/loss with quantity
+    const totalValue = item.quantity 
+        ? Math.abs(item.predictedPriceChange * (item.quantity || 0)) 
+        : 0;
+    
     return (
         <tr>
             <td>
@@ -130,6 +136,12 @@ const ItemTableRow: React.FC<ItemTableRowProps> = ({ item, type }) => {
             </td>
             <td className="text-right">{ROI}%</td>
             <td className="text-right">{item.confidence ? (item.confidence * 100).toFixed(1) : '-'}%</td>
+            <td className="text-right">
+                <div>{formatNumber(item.quantity || 0)}</div>
+                <div className="text-xs text-green">
+                    {totalValue > 0 ? `${formatNumber(totalValue)} gp` : ''}
+                </div>
+            </td>
             <td className="text-right hidden md:table-cell">{formatNumber(item.metrics.averageVolume)}</td>
             <td className="text-right hidden lg:table-cell">{item.metrics.liquidityScore?.toFixed(1) || '-'}</td>
         </tr>
@@ -178,6 +190,7 @@ const TradeTab: React.FC<TradeTabProps> = ({ type, items }) => {
                     <th className="text-right">Target Price</th>
                     <th className="text-right">ROI</th>
                     <th className="text-right">Confidence</th>
+                    <th className="text-right">Quantity</th>
                     <th className="text-right hidden md:table-cell">Volume</th>
                     <th className="text-right hidden lg:table-cell">Liquidity</th>
                 </tr>
@@ -322,6 +335,13 @@ const MarketDashboard: React.FC = () => {
                         value={`${performance?.avgConfidence ? (performance.avgConfidence * 100).toFixed(1) : '-'}%`}
                         icon={Percent}
                         color="purple"
+                    />
+                    <DashboardCard
+                        title="ML Model Type"
+                        value={"Bidirectional LSTM"}
+                        icon={DollarSign}
+                        color="pink"
+                        subvalue="Item-specific models"
                     />
                     <DashboardCard
                         title="Last Update"

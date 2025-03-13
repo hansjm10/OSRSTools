@@ -52,7 +52,7 @@ body {
 
 @media (min-width: 1024px) {
     .stats-grid {
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(5, 1fr);
     }
 }
 
@@ -95,6 +95,10 @@ body {
 
 .stat-card.indigo::before {
     background-color: #6366f1;
+}
+
+.stat-card.pink::before {
+    background-color: #ec4899;
 }
 
 .stat-card-content {
